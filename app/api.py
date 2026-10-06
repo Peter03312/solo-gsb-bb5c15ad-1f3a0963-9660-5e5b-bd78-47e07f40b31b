@@ -8,6 +8,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from . import models, schemas
+from .acknowledgment import (
+    STATUS_ACTIVE,
+    STATUS_INVALIDATED,
+    ack_fingerprint,
+    invalidation_diff,
+    revision_set,
+)
 from .compliance import Seg, evaluate_driver
 from .db import get_db
 from .reassignment import (
@@ -91,6 +98,28 @@ def _evaluate_current(db: Session, driver_id: str) -> dict:
     return evaluate_driver([_to_seg(s) for s in segs])
 
 
+def _invalidate_stale_acknowledgments(db: Session, driver_id: str) -> None:
+    """片段写操作落库前调用：把该司机名下修订集合已不匹配的活跃确认标记为失效。
+
+    与片段变更处于同一事务（且写路径均持有同一把咨询锁），
+    确认失效与片段增删/修订同生同死；失效原因一并固化，查询时直接返回。
+    调用前需先 flush，使本函数读到变更后的片段集合。
+    """
+    current = revision_set((s.segment_id, s.revision) for s in _driver_segments(db, driver_id))
+    stmt = select(models.Acknowledgment).where(
+        models.Acknowledgment.driver_id == driver_id,
+        models.Acknowledgment.status == STATUS_ACTIVE,
+    )
+    now = datetime.now(timezone.utc)
+    for ack in db.execute(stmt).scalars():
+        diff = invalidation_diff(ack.segment_revisions, current)
+        if diff is None:
+            continue
+        ack.status = STATUS_INVALIDATED
+        ack.invalidation = diff
+        ack.invalidated_at = now
+
+
 # ---------------------------------------------------------------- 司机
 
 @router.post("/drivers", response_model=schemas.DriverOut, status_code=201, tags=["drivers"])
@@ -156,6 +185,8 @@ def create_segment(body: schemas.SegmentCreate, response: Response, db: Session 
         revision=1,
     )
     db.add(seg)
+    db.flush()  # 让失效扫描读到新片段（会话 autoflush=False）
+    _invalidate_stale_acknowledgments(db, body.driver_id)  # 新增片段使修订集合不匹配的确认失效
     db.commit()
     db.refresh(seg)
     return seg
@@ -199,11 +230,17 @@ def correct_segment(segment_id: str, body: schemas.SegmentPatch, db: Session = D
     _get_driver_or_404(db, new_driver)
     _ensure_no_overlap(db, new_driver, new_start, new_end, exclude_segment_id=segment_id)
 
+    old_driver = seg.driver_id
     seg.driver_id = new_driver
     seg.start_utc = new_start
     seg.end_utc = new_end
     seg.type = new_type
     seg.revision += 1
+    db.flush()  # 让失效扫描读到更正后的片段（会话 autoflush=False）
+    # 片段修订（及可能的调出/调入）使相关司机名下修订集合不匹配的确认失效
+    _invalidate_stale_acknowledgments(db, new_driver)
+    if old_driver != new_driver:
+        _invalidate_stale_acknowledgments(db, old_driver)
     db.commit()
     db.refresh(seg)
     return seg
@@ -392,6 +429,10 @@ def _apply_reassignment_batch(
     # （仍在同一事务内，未提交；随后失败可整体回滚）
     db.flush()
 
+    # 6.5 片段已增删/修订：受影响司机名下修订集合不再匹配的活跃确认即刻失效（同事务落库）
+    for d in affected:
+        _invalidate_stale_acknowledgments(db, d)
+
     # 7. 调整后的实时合规结论
     after = {d: _compliance_summary(db, d, evaluated_at) for d in affected}
 
@@ -462,6 +503,130 @@ def get_compliance(driver_id: str, db: Session = Depends(get_db)):
         compliant=result["compliant"],
         violations=result["violations"],
     )
+
+
+# ---------------------------------------------------------------- 告警确认
+
+@router.post(
+    "/drivers/{driver_id}/acknowledgments",
+    response_model=schemas.AcknowledgmentResponse,
+    status_code=201,
+    tags=["acknowledgments"],
+)
+def create_acknowledgment(
+    driver_id: str, body: schemas.AcknowledgmentCreate, response: Response, db: Session = Depends(get_db)
+):
+    """告警确认：只能针对**当前实时结果中存在的违规**创建确认记录。
+
+    - 创建时固化提交时刻覆盖的片段修订集合（司机全部现存片段的
+      ``(segment_id, revision)``）与命中的违规明细。
+    - 同一司机、同一规则且修订集合未变时重复提交返回原记录
+      （HTTP 200、``created_new=false``），备注不同也不新增。
+    - 司机不存在返回 404 ``driver_not_found``；当前实时结果中不存在该规则的
+      违规返回 409 ``violation_not_found``。
+    - 任一片段增删或修订后，原确认由片段写路径标记为失效，查询返回失效原因。
+    """
+    # 与片段写操作共用同一把咨询锁：确认创建与片段变更全局串行，
+    # 失效扫描不会漏掉并发创建中的确认记录
+    _xact_lock(db)
+    if db.get(models.Driver, driver_id) is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "driver_not_found",
+                "message": f"司机 '{driver_id}' 不存在",
+                "driver_id": driver_id,
+            },
+        )
+
+    segs = _driver_segments(db, driver_id)
+    revisions = revision_set((s.segment_id, s.revision) for s in segs)
+    fingerprint = ack_fingerprint(driver_id, body.rule.value, revisions)
+
+    # 幂等：同司机同规则且修订集合未变 -> 返回原记录（即使备注不同也不新增）
+    stmt = select(models.Acknowledgment).where(
+        models.Acknowledgment.driver_id == driver_id,
+        models.Acknowledgment.rule == body.rule.value,
+        models.Acknowledgment.fingerprint == fingerprint,
+    )
+    existing = db.execute(stmt).scalars().first()
+    if existing is not None:
+        response.status_code = 200
+        return schemas.AcknowledgmentResponse(created_new=False, acknowledgment=existing)
+
+    # 只能确认当前实时结果中存在的违规
+    result = evaluate_driver([_to_seg(s) for s in segs])
+    violation = next((v for v in result["violations"] if v["rule"] == body.rule.value), None)
+    if violation is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "violation_not_found",
+                "message": (
+                    f"司机 '{driver_id}' 当前实时结果中不存在规则 "
+                    f"'{body.rule.value}' 的违规，无法确认"
+                ),
+                "driver_id": driver_id,
+                "rule": body.rule.value,
+                "current_violations": [v["rule"] for v in result["violations"]],
+            },
+        )
+
+    ack = models.Acknowledgment(
+        driver_id=driver_id,
+        rule=body.rule.value,
+        note=body.note,
+        fingerprint=fingerprint,
+        segment_revisions=revisions,
+        violation_snapshot=violation,
+        status=STATUS_ACTIVE,
+    )
+    db.add(ack)
+    try:
+        db.commit()
+    except IntegrityError:
+        # 并发下同司机同规则同集合的确认已被其他事务抢先提交：只留一条，返回原记录
+        db.rollback()
+        ack = db.execute(stmt).scalars().one()
+        response.status_code = 200
+        return schemas.AcknowledgmentResponse(created_new=False, acknowledgment=ack)
+
+    db.refresh(ack)
+    return schemas.AcknowledgmentResponse(created_new=True, acknowledgment=ack)
+
+
+@router.get(
+    "/drivers/{driver_id}/acknowledgments",
+    response_model=list[schemas.AcknowledgmentOut],
+    tags=["acknowledgments"],
+)
+def list_acknowledgments(
+    driver_id: str, status: schemas.AckStatus | None = None, db: Session = Depends(get_db)
+):
+    """列出司机的全部告警确认（按创建顺序）；失效记录附带失效原因。
+
+    可用 ``?status=ACTIVE`` 或 ``?status=INVALIDATED`` 过滤。
+    """
+    _get_driver_or_404(db, driver_id)
+    stmt = select(models.Acknowledgment).where(models.Acknowledgment.driver_id == driver_id)
+    if status is not None:
+        stmt = stmt.where(models.Acknowledgment.status == status.value)
+    stmt = stmt.order_by(models.Acknowledgment.ack_id)
+    return list(db.execute(stmt).scalars())
+
+
+@router.get(
+    "/drivers/{driver_id}/acknowledgments/{ack_id}",
+    response_model=schemas.AcknowledgmentOut,
+    tags=["acknowledgments"],
+)
+def get_acknowledgment(driver_id: str, ack_id: int, db: Session = Depends(get_db)):
+    """查看单条确认记录；已失效的记录附带失效原因。"""
+    _get_driver_or_404(db, driver_id)
+    ack = db.get(models.Acknowledgment, ack_id)
+    if ack is None or ack.driver_id != driver_id:
+        raise HTTPException(status_code=404, detail=f"确认记录 '{ack_id}' 不存在")
+    return ack
 
 
 # ---------------------------------------------------------------- 审核发布

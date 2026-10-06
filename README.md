@@ -2,7 +2,7 @@
 
 基于 **FastAPI + PostgreSQL** 的司机值勤合规核算服务：录入司机与值勤片段（驾驶 / 其他值勤 / 休息），
 按现存记录实时核算两项合规规则，支持按修订号更正、**跨司机值勤批量调整（批次原子提交）**、
-审核发布固化历史版本并与当前结果对照。
+审核发布固化历史版本并与当前结果对照，以及对当前违规的**告警确认**（片段变更自动失效）。
 
 ## 合规规则
 
@@ -62,6 +62,9 @@ Compose 会启动两个容器：`db`（PostgreSQL 16，端口 5432）与 `app`�
 | GET | `/drivers/{driver_id}/audits/{audit_id}/compare` | 历史版本 vs 当前重算结果对照（含输入修订差异） |
 | POST | `/reassignment-batches` | 跨司机批量调整：整批原子提交，按最终排布查重叠；同批次号同内容幂等，异内容 409 |
 | GET | `/reassignment-batches/{batch_id}` | 查看批次首次提交结果（成功结论；被拒绝批次返回首次的 4xx 明细） |
+| POST | `/drivers/{driver_id}/acknowledgments` | 告警确认：仅针对当前实时违规创建，固化覆盖的片段修订集合；同司机同规则同修订集合重复提交返回原记录（备注不同不新增） |
+| GET | `/drivers/{driver_id}/acknowledgments` | 确认记录列表（`?status=ACTIVE\|INVALIDATED` 过滤）；失效记录附失效原因 |
+| GET | `/drivers/{driver_id}/acknowledgments/{ack_id}` | 查看单条确认记录（含失效原因） |
 
 片段类型 `type`：`DRIVING`（驾驶）、`OTHER_DUTY`（其他值勤）、`REST`（休息）。
 时间须为带时区的 ISO 8601（建议 UTC，如 `2026-10-05T08:00:00Z`），服务统一按 UTC 存储与计算。
@@ -109,6 +112,26 @@ curl -s -X POST http://localhost:8000/reassignment-batches \
 
 # 同批次号同内容重试 -> 200 replayed=true（修订号不再增加）；异内容 -> 409
 curl -s http://localhost:8000/reassignment-batches/BATCH-SWAP-01
+
+# 告警确认：只能针对当前实时结果中存在的违规创建（201，created_new=true）
+curl -s -X POST http://localhost:8000/drivers/DRV-1001/acknowledgments \
+  -H 'Content-Type: application/json' \
+  -d '{"rule":"ROLLING_24H_DUTY_LIMIT","note":"已通知司机，安排调休"}'
+
+# 同司机同规则且修订集合未变 -> 200 返回原记录（created_new=false），备注不同也不新增
+curl -s -X POST http://localhost:8000/drivers/DRV-1001/acknowledgments \
+  -H 'Content-Type: application/json' \
+  -d '{"rule":"ROLLING_24H_DUTY_LIMIT","note":"换个备注也不会新增"}'
+
+# 当前不存在的违规 -> 409 violation_not_found；司机不存在 -> 404 driver_not_found
+curl -s -X POST http://localhost:8000/drivers/DRV-1001/acknowledgments \
+  -H 'Content-Type: application/json' \
+  -d '{"rule":"CONTINUOUS_DRIVING_LIMIT","note":"当前并无该违规"}'
+
+# 查询确认记录：任一片段增删或修订后原确认失效（INVALIDATED），响应附失效原因
+curl -s http://localhost:8000/drivers/DRV-1001/acknowledgments
+curl -s 'http://localhost:8000/drivers/DRV-1001/acknowledgments?status=ACTIVE'
+curl -s http://localhost:8000/drivers/DRV-1001/acknowledgments/1
 ```
 
 ### 跨司机批量调整语义
@@ -171,6 +194,70 @@ curl -s http://localhost:8000/reassignment-batches/BATCH-SWAP-01
 }
 ```
 
+### 告警确认语义
+
+- 请求体：`rule`（违规规则标识）+ `note`（确认备注）。服务按现存记录**实时重算**，
+  只有当前结果中真实存在的违规才能被确认：司机不存在返回 404 `driver_not_found`，
+  当前无该规则违规返回 409 `violation_not_found`（响应附当前实际违规列表）。
+- 创建时固化**提交时刻覆盖的片段修订集合**（该司机全部现存片段的 `(segment_id, revision)`，
+  按片段 ID 排序）与命中的违规明细（`violation_snapshot`），作为后续失效判定的基准。
+- 幂等键 = 司机 + 规则 + 修订集合指纹（**不含备注**）：同一司机、同一规则且修订集合未变时，
+  重复提交返回原记录（HTTP 200、`created_new=false`），备注不同也不新增；
+  `(driver_id, rule, fingerprint)` 唯一约束保证并发提交只留一条。
+- **失效**：任一片段增删或修订（录入、按修订号更正、批量调整，含片段调入/调出本司机）后，
+  该司机名下修订集合不再匹配的活跃确认在**同一事务**内被标记为 `INVALIDATED`，
+  并固化失效原因（`invalidation`：新增 / 移除 / 修订号变化的片段明细与人类可读摘要），
+  查询接口原样返回。修订集合变化后若违规仍存在，可再次提交生成新记录，旧记录保持失效可查。
+
+告警确认创建响应示例：
+
+```json
+{
+  "created_new": true,
+  "acknowledgment": {
+    "ack_id": 1,
+    "driver_id": "DRV-1001",
+    "rule": "ROLLING_24H_DUTY_LIMIT",
+    "note": "已通知司机，安排调休",
+    "fingerprint": "9f2c…",
+    "segment_revisions": [
+      {"segment_id": "SEG-A", "revision": 1},
+      {"segment_id": "SEG-C", "revision": 2},
+      {"segment_id": "SEG-D", "revision": 1}
+    ],
+    "violation_snapshot": {
+      "rule": "ROLLING_24H_DUTY_LIMIT",
+      "first_violation_at": "2026-10-05T19:10:00+00:00",
+      "segment_ids": ["SEG-A", "SEG-C", "SEG-D"],
+      "detail": {"window_seconds": 86400, "limit_seconds": 36000}
+    },
+    "status": "ACTIVE",
+    "invalidation": null,
+    "created_at": "2026-10-06T03:20:00Z",
+    "invalidated_at": null
+  }
+}
+```
+
+片段更正后查询同一记录（失效原因随记录返回）：
+
+```json
+{
+  "ack_id": 1,
+  "status": "INVALIDATED",
+  "invalidation": {
+    "reason": "片段已修订 SEG-D(修订号 1→2)",
+    "added": [],
+    "removed": [],
+    "revision_changed": [
+      {"segment_id": "SEG-D", "acknowledged_revision": 1, "current_revision": 2}
+    ]
+  },
+  "invalidated_at": "2026-10-06T03:25:00Z"
+}
+```
+
+
 ## 测试
 
 ```bash
@@ -191,3 +278,4 @@ docker compose run --rm app python -m pytest -q
 - **审核发布不可变**：发布时对全部输入片段的 `(segment_id, revision)` 计算 SHA-256 指纹并连同结论一起固化；`(driver_id, fingerprint)` 唯一约束保证同修订并发发布只留一版（冲突方拿到既有版本）；快照无任何修改入口，之后的更正不影响旧版，可随时用 compare 接口对照当前结果。
 - **跨司机批量调整**：批次内容（每条的片段 ID/预期修订/目标司机/起止/类型）规范化为 UTC 并按片段 ID 排序后计算 SHA-256 指纹；批次号主键 + 指纹实现“同内容重放、异内容冲突”。执行时先对全部被调整片段 `SELECT ... FOR UPDATE` 并逐条比对修订号，再按所有调整完成后的**最终排布**分组做重叠检查，全部通过才在同一事务里落库（每条修订号只 +1）并固化批次结果；任何一步失败都回滚、记录零改动。
 - **并发安全**：所有片段写操作（录入 / 单片段更正 / 批量调整）在事务入口获取同一把 PostgreSQL 事务级咨询锁（`pg_advisory_xact_lock`），写事务因此全局串行，并发批次也无法绕过修订与重叠检查；锁随事务提交/回滚自动释放。批量调整的纯排布逻辑在 `app/reassignment.py` 中独立实现（仅依赖标准库）。
+- **告警确认**：确认创建同样持有该咨询锁，与片段写操作全局串行——失效扫描不会漏掉并发创建中的确认记录。确认记录固化提交时覆盖的片段修订集合与命中违规明细；幂等指纹只含司机、规则与修订集合（不含备注），同集合重复提交返回原记录。所有片段写路径（录入 / 更正 / 批量调整）在同事务内把修订集合不再匹配的活跃确认标记为失效并固化失效原因，确认失效与片段变更同生同死。指纹与失效判定的纯逻辑在 `app/acknowledgment.py` 中独立实现（仅依赖标准库）。

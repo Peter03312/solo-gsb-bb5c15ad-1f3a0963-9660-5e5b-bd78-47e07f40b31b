@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # 端到端调用示例：录入 -> 幂等/冲突 -> 重叠校验 -> 合规查询 -> 更正 -> 审核发布 -> 历史对照
+#              -> 跨司机批量调整 -> 告警确认（创建/幂等/失效/再确认）
 # 用法: BASE_URL=http://localhost:8000 ./examples/demo.sh
 set -uo pipefail
 
@@ -131,3 +132,30 @@ req POST /reassignment-batches '{
 
 echo "########## 17. 查询批次首次提交结果"
 req GET /reassignment-batches/BATCH-SWAP-01
+
+echo "########## 18. 告警确认：构造违规（DRV-3003 驾驶 08-12 + 12-13，累计 5h 越限于 12:00）"
+req POST /drivers '{"driver_id":"DRV-3003","name":"王五"}'
+req POST /segments '{"segment_id":"SEG-K1","driver_id":"DRV-3003","start_utc":"2026-10-08T08:00:00Z","end_utc":"2026-10-08T12:00:00Z","type":"DRIVING"}'
+req POST /segments '{"segment_id":"SEG-K2","driver_id":"DRV-3003","start_utc":"2026-10-08T12:00:00Z","end_utc":"2026-10-08T13:00:00Z","type":"DRIVING"}'
+req GET /drivers/DRV-3003/compliance
+# 期望：CONTINUOUS_DRIVING_LIMIT，首次越限 2026-10-08T12:00:00Z，参与片段 SEG-K1、SEG-K2
+
+echo "########## 19. 创建告警确认（201 created_new=true，固化覆盖的片段修订集合）"
+req POST /drivers/DRV-3003/acknowledgments '{"rule":"CONTINUOUS_DRIVING_LIMIT","note":"已电话告知司机，责令整改"}'
+echo "---- 同司机同规则且修订集合未变：重复提交返回原记录（200 created_new=false），备注不同也不新增"
+req POST /drivers/DRV-3003/acknowledgments '{"rule":"CONTINUOUS_DRIVING_LIMIT","note":"换个备注也不会新增"}'
+echo "---- 当前不存在的违规 -> 409 violation_not_found；司机不存在 -> 404 driver_not_found"
+req POST /drivers/DRV-3003/acknowledgments '{"rule":"ROLLING_24H_DUTY_LIMIT","note":"当前并无该违规"}'
+req POST /drivers/DRV-9999/acknowledgments '{"rule":"CONTINUOUS_DRIVING_LIMIT","note":"司机不存在"}'
+
+echo "########## 20. 任一片段增删或修订后原确认失效：更正 SEG-K2 -> 查询返回失效原因"
+req PATCH /segments/SEG-K2 '{"expected_revision":1,"end_utc":"2026-10-08T12:30:00Z"}'
+req GET /drivers/DRV-3003/acknowledgments
+# 期望：status=INVALIDATED，invalidation.reason 指明 SEG-K2 修订号 1→2
+
+echo "########## 21. 修订集合已变且违规仍存在 -> 可再次提交生成新记录；旧记录保持失效可查"
+req GET /drivers/DRV-3003/compliance
+req POST /drivers/DRV-3003/acknowledgments '{"rule":"CONTINUOUS_DRIVING_LIMIT","note":"修订后再次确认"}'
+req GET /drivers/DRV-3003/acknowledgments
+req GET '/drivers/DRV-3003/acknowledgments?status=ACTIVE'
+# 期望：列表两条记录（#1 INVALIDATED 附失效原因，#2 ACTIVE）；过滤后只剩 #2
