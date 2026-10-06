@@ -47,6 +47,31 @@ class ReassignmentBatch(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class Acknowledgment(Base):
+    """告警确认：针对创建时刻实时结果中存在的某条违规的确认记录。
+
+    创建时固化所覆盖的片段修订集合（当时该司机全部现存片段的
+    (segment_id, revision) 集合）及其指纹；之后任一片段增删或修订
+    都会使确认失效（查询时按现存记录实时比对，不落库、无修改入口）。
+    (driver_id, rule, fingerprint) 唯一约束保证同司机同规则同修订集合
+    的重复/并发提交只留一条记录。
+    """
+
+    __tablename__ = "acknowledgments"
+    __table_args__ = (
+        UniqueConstraint("driver_id", "rule", "fingerprint", name="uq_ack_driver_rule_fingerprint"),
+    )
+
+    ack_id = Column(Integer, primary_key=True, autoincrement=True)
+    driver_id = Column(String(64), ForeignKey("drivers.driver_id"), nullable=False, index=True)
+    rule = Column(String(64), nullable=False)  # 违规规则标识
+    note = Column(String(2000), nullable=False)  # 确认备注（重复提交不更新）
+    fingerprint = Column(String(64), nullable=False)  # 提交时覆盖的修订集合指纹
+    segment_revisions = Column(JSONType, nullable=False)  # [{"segment_id":..,"revision":..}, ...]
+    violation = Column(JSONType, nullable=False)  # 确认针对的违规快照（规则/首次越限时刻/参与片段）
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class AuditSnapshot(Base):
     """审核发布快照：固化发布时刻的输入修订与合规结论，之后更正不影响旧版。"""
 

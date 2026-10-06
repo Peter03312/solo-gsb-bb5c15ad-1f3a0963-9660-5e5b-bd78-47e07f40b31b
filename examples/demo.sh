@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # 端到端调用示例：录入 -> 幂等/冲突 -> 重叠校验 -> 合规查询 -> 更正 -> 审核发布 -> 历史对照
+#               -> 跨司机批量调整 -> 告警确认（创建/幂等/失效/重新确认）
 # 用法: BASE_URL=http://localhost:8000 ./examples/demo.sh
 set -uo pipefail
 
@@ -131,3 +132,31 @@ req POST /reassignment-batches '{
 
 echo "########## 17. 查询批次首次提交结果"
 req GET /reassignment-batches/BATCH-SWAP-01
+
+echo "########## 18. 告警确认：当前无该违规 -> 409 violation_not_active；司机不存在 -> 404"
+req POST /drivers/DRV-1001/acknowledgments '{"rule":"ROLLING_24H_DUTY_LIMIT","note":"提前确认"}'
+req POST /drivers/DRV-GHOST/acknowledgments '{"rule":"ROLLING_24H_DUTY_LIMIT","note":"x"}'
+
+echo "########## 19. 补录其他值勤 19:30-20:00 -> 滚动 24h 值勤合计 10h20m 越限"
+req POST /segments '{"segment_id":"SEG-F","driver_id":"DRV-1001","start_utc":"2026-10-05T19:30:00Z","end_utc":"2026-10-05T20:00:00Z","type":"OTHER_DUTY"}'
+req GET /drivers/DRV-1001/compliance
+# 期望：ROLLING_24H_DUTY_LIMIT，首次越限 2026-10-05T19:40:00Z，参与片段 SEG-A、SEG-C、SEG-D、SEG-F
+
+echo "########## 20. 确认当前存在的违规 -> 201 created_new=true（固化覆盖的片段修订集合与违规快照）"
+req POST /drivers/DRV-1001/acknowledgments '{"rule":"ROLLING_24H_DUTY_LIMIT","note":"已知晓，安排调休"}'
+
+echo "########## 21. 同司机同规则且修订集合未变：重复提交（备注不同）-> 200 返回原记录，不新增不更新"
+req POST /drivers/DRV-1001/acknowledgments '{"rule":"ROLLING_24H_DUTY_LIMIT","note":"另一个备注"}'
+req GET /drivers/DRV-1001/acknowledgments
+# 期望：仍只有 1 条记录，备注仍为“已知晓，安排调休”，valid=true
+
+echo "########## 22. 任一片段修订后原确认失效：更正 SEG-F 缩短到 19:45（仍越限），查询返回失效原因"
+req PATCH /segments/SEG-F '{"expected_revision":1,"end_utc":"2026-10-05T19:45:00Z"}'
+req GET /drivers/DRV-1001/acknowledgments
+# 期望：valid=false，invalidation_reason.code=segment_revision_changed（SEG-F 修订号 1 -> 2）
+
+echo "########## 23. 失效后重新提交（违规仍存在、修订集合已变）-> 201 新记录；旧记录保留失效原因"
+req POST /drivers/DRV-1001/acknowledgments '{"rule":"ROLLING_24H_DUTY_LIMIT","note":"更正后再次确认"}'
+req GET /drivers/DRV-1001/acknowledgments
+# 期望：2 条记录——旧记录 valid=false（含失效原因），新记录 valid=true
+req GET /drivers/DRV-1001/acknowledgments/1

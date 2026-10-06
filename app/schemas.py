@@ -11,6 +11,13 @@ class SegmentType(str, Enum):
     REST = "REST"
 
 
+class RuleType(str, Enum):
+    """合规规则标识（与 app.compliance 中的规则常量一致）。"""
+
+    ROLLING_24H_DUTY_LIMIT = "ROLLING_24H_DUTY_LIMIT"
+    CONTINUOUS_DRIVING_LIMIT = "CONTINUOUS_DRIVING_LIMIT"
+
+
 def _aware_utc(v: datetime) -> datetime:
     if v.tzinfo is None or v.tzinfo.utcoffset(v) is None:
         raise ValueError("时间必须携带时区（建议使用 UTC，如 2026-10-05T08:00:00Z）")
@@ -192,3 +199,50 @@ class ReassignmentBatchOut(BaseModel):
     affected_drivers: list[DriverReassignmentEffect]
     segment_changes: list[SegmentReassignmentChange]
     request_payload: list[dict[str, Any]]
+
+
+# ------------------------------------------------------------ 告警确认
+
+
+class AcknowledgmentCreate(BaseModel):
+    """提交告警确认：违规规则 + 确认备注。"""
+
+    rule: RuleType
+    note: str = Field(min_length=1, max_length=2000)
+
+
+class AckRevisionChange(BaseModel):
+    segment_id: str
+    acknowledged_revision: int  # 确认时固化的修订号
+    current_revision: int  # 当前现存记录的修订号
+
+
+class AckRevisionChanges(BaseModel):
+    """固化修订集合与当前集合的三类差异（任一非空即失效）。"""
+
+    added: list[str]  # 确认后新增的片段
+    removed: list[str]  # 确认后被删除的片段
+    revision_changed: list[AckRevisionChange]  # 确认后被修订的片段
+
+
+class InvalidationReason(BaseModel):
+    code: str  # segment_added / segment_removed / segment_revision_changed / segments_changed
+    message: str
+    changes: AckRevisionChanges
+
+
+class AcknowledgmentOut(BaseModel):
+    ack_id: int
+    driver_id: str
+    rule: str
+    note: str
+    segment_revisions: list[InputRevision]  # 提交时覆盖的片段修订集合
+    violation: dict[str, Any]  # 确认针对的违规快照
+    valid: bool  # False 表示任一片段已增删或修订，确认失效
+    invalidation_reason: Optional[InvalidationReason]  # 失效原因（valid=True 时为 null）
+    created_at: datetime
+
+
+class AcknowledgmentResponse(BaseModel):
+    created_new: bool  # False 表示同司机同规则同修订集合的确认已存在，返回原记录
+    acknowledgment: AcknowledgmentOut
